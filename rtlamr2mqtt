@@ -28,14 +28,11 @@ import logging.handlers
 # Logging setup
 logger = logging.getLogger("rtlamr2mqtt")
 logger.setLevel(logging.INFO)
+
 syslog_handler = logging.handlers.SysLogHandler(address='/dev/log')
 formatter = logging.Formatter('%(name)s: %(levelname)s %(message)s')
 syslog_handler.setFormatter(formatter)
 logger.addHandler(syslog_handler)
-# Also log to console
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
 
 # Constants
 HC_SECONDS_INTERVAL = 5 * 60
@@ -43,9 +40,9 @@ HC_URL = 'https://hc-ping.com/887eec44-d131-4802-a4d9-0d69876cb9ce'
 
 def shutdown(signum, frame):
     """Shutdown handler to terminate processes."""
+    logger.info("Shutdown signal received. Exiting.")
     for process in ['rtlamr', 'rtl_tcp', 'rtlamr2mqtt']:
         subprocess.call(f'/usr/bin/pkill -9 {process}', shell=True)
-    logger.info("Shutdown signal received. Exiting.")
     sys.exit(0)
 
 def send_mqtt(topic, payload, auth):
@@ -74,10 +71,12 @@ def process_water_meter(lineFields):
     }
     for key, value in water_data.items():
         send_mqtt(f'Home/WaterMeter/{key}', value, auth)
+        logger.info(f"Water Meter {key}: {value}")
 
 def process_gas_meter(lineFields):
     """Process gas meter data and send MQTT messages."""
     send_mqtt('Home/GasMeterTotalValue', lineFields[7], auth)
+    logger.info(f"Gas Meter {lineFields[3]}: {lineFields[7]}")
 
 def health_check():
     """Perform health check."""
@@ -130,11 +129,16 @@ if __name__ == "__main__":
                 process_gas_meter(lineFields)
             else:
                 logger.warning(f'Received unknown ID: {lineFields[3]}')
-
-            hc_current_seconds = time.time()
-            if hc_current_seconds - hc_previous_seconds > HC_SECONDS_INTERVAL or hc_current_seconds < hc_previous_seconds:
-                health_check()
-                hc_previous_seconds = hc_current_seconds
+            
+            # Perform health check every HC_SECONDS_INTERVAL seconds
+            try:
+                hc_current_seconds = time.time()
+                if hc_current_seconds - hc_previous_seconds > HC_SECONDS_INTERVAL or hc_current_seconds < hc_previous_seconds:
+                    health_check()
+                    hc_previous_seconds = hc_current_seconds
+            except Exception as ex:
+                logger.error(f"Error processing line: {ex}")
+                time.sleep(2)
 
     except Exception as ex:
         logger.error(f"Fatal error: {ex}")
