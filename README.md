@@ -1,10 +1,31 @@
-# AMRIDM2MQTT: Send AMR/ERT Power Meter Data Over MQTT
+# AMRIDM2MQTT: Send AMR/ERT Utility Meter Data Over MQTT
 
 ##### Copyright (c) 2018 Ben Johnson. Distributed under MIT License.
 
-Using an [inexpensive rtl-sdr dongle](https://www.amazon.com/s/ref=nb_sb_noss?field-keywords=RTL2832U), it's possible to listen for signals from ERT compatible smart meters using rtlamr. This script runs as a daemon, launches rtl_tcp and rtlamr, and parses the output from rtlamr. If this matches your meter, it will push the data into MQTT for consumption by Home Assistant, OpenHAB, or custom scripts.
+Using an [inexpensive rtl-sdr dongle](https://www.amazon.com/s/ref=nb_sb_noss?field-keywords=RTL2832U), it's possible to listen for signals from ERT compatible smart meters using rtlamr. This script runs as a daemon, launches rtl_tcp and rtlamr, and parses the output from rtlamr. When it detects data from your configured meters, it publishes the readings to MQTT for consumption by Home Assistant, OpenHAB, or custom scripts.
 
-TODO: Video for Home Assistant
+## Supported Meters
+
+This service supports both water and gas meters that use the ERT (Encoder Receiver Transmitter) protocol. It can track:
+
+### Water Meters
+- Total consumption
+- No usage periods
+- Backflow detection
+- Leak detection (both current and historical)
+- All data is published to MQTT topics under `Home/WaterMeter/`
+
+### Gas Meters
+- Total consumption
+- Published to MQTT topic `Home/GasMeterTotalValue`
+
+## Features
+- Real-time meter monitoring using rtl-sdr
+- Automatic reconnection on connection loss
+- Health check monitoring via HTTP
+- Configurable meter ID filtering
+- Systemd service integration
+- Detailed logging with syslog integration
 
 
 ## Docker
@@ -109,19 +130,41 @@ Set amridm2mqtt to run on startup
 
 ### Configure Home Assistant
 
-To use these values in Home Assistant,
-```
+To use these values in Home Assistant, add the following to your configuration:
+
+#### Water Meter Configuration
+```yaml
 sensor:
   - platform: mqtt
-    state_topic: "readings/12345678/meter_reading"
-    name: "Power Meter"
-    unit_of_measurement: kWh
-
+    state_topic: "Home/WaterMeter/TotalValue"
+    name: "Water Meter Total"
+    unit_of_measurement: "gal"
+    
   - platform: mqtt
-    state_topic: "readings/12345678/meter_rate"
-    name: "Power Meter Avg Usage 5 mins"
-    unit_of_measurement: W
-  ```
+    state_topic: "Home/WaterMeter/NoUse"
+    name: "Water No Usage"
+    device_class: "duration"
+    
+  - platform: mqtt
+    state_topic: "Home/WaterMeter/BackFlow"
+    name: "Water Backflow"
+    
+  - platform: mqtt
+    state_topic: "Home/WaterMeter/LeakDetected"
+    name: "Water Leak History"
+    device_class: "problem"
+    
+  - platform: mqtt
+    state_topic: "Home/WaterMeter/LeakNowDetected"
+    name: "Water Leak Current"
+    device_class: "problem"
+
+#### Gas Meter Configuration
+  - platform: mqtt
+    state_topic: "Home/GasMeterTotalValue"
+    name: "Gas Meter Total"
+    unit_of_measurement: "CCF"
+```
 
 ## Testing
 
