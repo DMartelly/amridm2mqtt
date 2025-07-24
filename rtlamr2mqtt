@@ -24,6 +24,7 @@ import settings
 import logging
 import logging.handlers
 
+from typing import Union, Optional, Dict, List
 
 # Logging setup
 logger = logging.getLogger("rtlamr2mqtt")
@@ -35,48 +36,109 @@ syslog_handler.setFormatter(formatter)
 logger.addHandler(syslog_handler)
 
 # Constants
-HC_SECONDS_INTERVAL = 5 * 60
+HC_SECONDS_INTERVAL = 5 * 60  # Health check interval in seconds
 HC_URL = 'https://hc-ping.com/887eec44-d131-4802-a4d9-0d69876cb9ce'
+PROCESS_LIST = ['rtlamr', 'rtl_tcp', 'rtlamr2mqtt']
+STARTUP_DELAY = 5  # Seconds to wait before starting processes
+RETRY_DELAY = 2  # Seconds to wait after an error before retrying
 
-def shutdown(signum, frame):
+# Field indices in the CSV output
+class MeterFields:
+    TIME = 0
+    ID = 3
+    WATER_NO_USE = 5
+    WATER_BACKFLOW = 6
+    CONSUMPTION = 7
+    WATER_LEAK = 9
+    WATER_LEAK_NOW = 10
+
+def shutdown(signum: int, frame: object) -> None:
     """Shutdown handler to terminate processes."""
     logger.info("Shutdown signal received. Exiting.")
     for process in ['rtlamr', 'rtl_tcp', 'rtlamr2mqtt']:
         subprocess.call(f'/usr/bin/pkill -9 {process}', shell=True)
     sys.exit(0)
 
-def send_mqtt(topic, payload, auth):
-    """Send MQTT message."""
+
+
+def send_mqtt(topic: str, payload: str, auth: Optional[Dict[str, str]]) -> None:
+    """Send MQTT message to the configured broker.
+    
+    Args:
+        topic: MQTT topic to publish to
+        payload: Message payload
+        auth: Optional authentication dictionary with username and password
+    """
     try:
         publish.single(topic, payload=payload, qos=1,
                        hostname=settings.MQTT_HOST, port=settings.MQTT_PORT, auth=auth)
     except Exception as ex:
         logger.error(f"MQTT Publish Failed: {ex}")
 
-def start_process(command, shell=False):
-    """Start a subprocess."""
-    return subprocess.Popen(
-        command, shell=shell, stdin=None, stdout=subprocess.PIPE if not shell else None,
-        stderr=None, close_fds=True
-    )
+def start_process(command: Union[List[str], str], shell: bool = False) -> subprocess.Popen:
+    """Start a subprocess with proper error handling.
+    
+    Args:
+        command: Command to execute, either as a list of arguments or shell command
+        shell: Whether to run the command through the shell
+        
+    Returns:
+        Popen: A subprocess.Popen object for the started process
+        
+    Raises:
+        subprocess.SubprocessError: If the process fails to start
+    """
+    try:
+        process = subprocess.Popen(
+            command, 
+            shell=shell, 
+            stdin=None, 
+            stdout=subprocess.PIPE if not shell else None,
+            stderr=subprocess.PIPE if not shell else None,
+            close_fds=True
+        )
+        logger.info(f"Started process: {command if isinstance(command, str) else ' '.join(command)}")
+        return process
+    except subprocess.SubprocessError as e:
+        logger.error(f"Failed to start process {command}: {e}")
+        raise
 
-def process_water_meter(lineFields):
-    """Process water meter data and send MQTT messages."""
-    water_data = {
-        'NoUse': lineFields[5],
-        'BackFlow': lineFields[6],
-        'TotalValue': str(float(lineFields[7]) / 10),
-        'LeakDetected': lineFields[9], # This stays on for a few weeks after a leak
-        'LeakNowDetected': lineFields[10]
-    }
-    for key, value in water_data.items():
-        send_mqtt(f'Home/WaterMeter/{key}', value, auth)
-        logger.info(f"Water Meter {key}: {value}")
+def process_water_meter(line_fields: List[str], auth: Optional[Dict[str, str]]) -> None:
+    """Process water meter data and send MQTT messages.
+    
+    Args:
+        line_fields: CSV fields from rtlamr output
+        auth: MQTT authentication credentials
+    """
+    try:
+        meter_id = line_fields[MeterFields.ID]
+        water_data = {
+            'NoUse': line_fields[MeterFields.WATER_NO_USE],
+            'BackFlow': line_fields[MeterFields.WATER_BACKFLOW],
+            'TotalValue': str(float(line_fields[MeterFields.CONSUMPTION]) / 10),
+            'LeakDetected': line_fields[MeterFields.WATER_LEAK],  # This stays on for a few weeks after a leak
+            'LeakNowDetected': line_fields[MeterFields.WATER_LEAK_NOW]
+        }
+        for key, value in water_data.items():
+            send_mqtt(f'Home/WaterMeter/{key}', value, auth)
+            logger.info(f"Water Meter {meter_id} {key}: {value}")
+    except (IndexError, ValueError) as e:
+        logger.error(f"Error processing water meter data: {e}, Fields: {line_fields}")
 
-def process_gas_meter(lineFields):
-    """Process gas meter data and send MQTT messages."""
-    send_mqtt('Home/GasMeterTotalValue', lineFields[7], auth)
-    logger.info(f"Gas Meter {lineFields[3]}: {lineFields[7]}")
+def process_gas_meter(line_fields: List[str], auth: Optional[Dict[str, str]]) -> None:
+    """Process gas meter data and send MQTT messages.
+    
+    Args:
+        line_fields: CSV fields from rtlamr output
+        auth: MQTT authentication credentials
+    """
+    try:
+        meter_id = line_fields[MeterFields.ID]
+        consumption = line_fields[MeterFields.CONSUMPTION]
+        send_mqtt('Home/GasMeterTotalValue', consumption, auth)
+        logger.info(f"Gas Meter {meter_id}: {consumption}")
+    except (IndexError, ValueError) as e:
+        logger.error(f"Error processing gas meter data: {e}, Fields: {line_fields}")
 
 def health_check():
     """Perform health check."""
@@ -97,38 +159,46 @@ if __name__ == "__main__":
 
         auth = {'username': settings.MQTT_USER, 'password': settings.MQTT_PASSWORD} if settings.MQTT_USER and settings.MQTT_PASSWORD else None
 
-        time.sleep(5)
+        time.sleep(STARTUP_DELAY)
         rtltcp = start_process([settings.RTL_TCP + " > /dev/null 2>&1 &"], shell=True)
-        time.sleep(5)
-        rtlamr = start_process([
+        time.sleep(STARTUP_DELAY)
+        
+        rtlamr_cmd = [
             os.path.expanduser(settings.RTLAMR),
             '-msgtype=scm,r900',
-            '-filterid=' + ','.join(settings.WATCHED_METERS),
+            f'-filterid={",".join(settings.WATCHED_METERS)}',
             '-format=csv'
-        ])
+        ]
+        rtlamr = start_process(rtlamr_cmd)
 
-        hc_previous_seconds = -200000
+        hc_previous_seconds = time.time() - HC_SECONDS_INTERVAL  # Ensure first health check happens soon
 
-        logger.info('Starting loop')
+        logger.info('Starting main processing loop')
 
         while True:
-            # rtlamr's readline returns byte list, remove whitespace and convert to string
-        
-            # Example Water JSON:
-            # {Time:2023-03-12T12:38:19.379 R900:{ID: 701279268 Unkn1:0x83 NoUse:36 BackFlow:0 Consumption: 156864 Unkn3:0x00 Leak: 0 LeakNow:0}}
-            # Example Gas JSON:
-            # {Time:2023-03-12T12:32:16.022 SCM:{ID:48558014 Type:12 Tamper:{Phy:03 Enc:00} Consumption:  572334 CRC:0x6629}}
-            amrline = rtlamr.stdout.readline().strip().decode()
-            # Example Water Read: '2023-03-12T12:29:39.41563046-04:00,0,0,701279268,131,36,0,156864,0,0,0'
-            # Example Gas Read: '2023-03-12T12:28:31.026929668-04:00,0,0,48558014,12,0x3,0x0,572332,0xcc8e'
-            lineFields = amrline.split(',')
+            try:
+                # rtlamr output format examples:
+                # Water: '2023-03-12T12:29:39.41563046-04:00,0,0,701279268,131,36,0,156864,0,0,0'
+                # Gas: '2023-03-12T12:28:31.026929668-04:00,0,0,48558014,12,0x3,0x0,572332,0xcc8e'
+                if rtlamr.stdout is None:
+                    raise RuntimeError("rtlamr process stdout is None")
+                    
+                amr_line = rtlamr.stdout.readline()
+                if not amr_line:  # EOF
+                    raise RuntimeError("rtlamr process ended unexpectedly")
+                    
+                line_fields = amr_line.strip().decode().split(',')
+                meter_id = line_fields[MeterFields.ID]
 
-            if len(lineFields) == 11 and lineFields[3] in settings.WATCHED_METERS:
-                process_water_meter(lineFields)
-            elif len(lineFields) == 9 and lineFields[3] in settings.WATCHED_METERS:
-                process_gas_meter(lineFields)
-            else:
-                logger.warning(f'Received unknown ID: {lineFields[3]}')
+                if len(line_fields) == 11 and meter_id in settings.WATCHED_METERS:
+                    process_water_meter(line_fields, auth)
+                elif len(line_fields) == 9 and meter_id in settings.WATCHED_METERS:
+                    process_gas_meter(line_fields, auth)
+                elif meter_id:  # Only log if we got a valid meter ID
+                    logger.warning(f'Received unknown meter ID: {meter_id}')
+            except Exception as ex:
+                logger.error(f"Error processing rtlamr output: {ex}")
+                time.sleep(RETRY_DELAY)
             
             # Perform health check every HC_SECONDS_INTERVAL seconds
             try:
@@ -137,7 +207,7 @@ if __name__ == "__main__":
                     health_check()
                     hc_previous_seconds = hc_current_seconds
             except Exception as ex:
-                logger.error(f"Error processing line: {ex}")
+                logger.error(f"Error processing health check: {ex}")
                 time.sleep(2)
 
     except Exception as ex:
