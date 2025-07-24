@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+'''
+Runs rtlamr to watch for IDM broadcasts from power meter. If meter id
+is in the list, usage is sent to MQTT broker.
+
+WATCHED_METERS = A Python list indicating those meter IDs to record and post.
+MQTT_HOST = String containing the MQTT server address.
+MQTT_PORT = An int containing the port the MQTT server is active on.
+
+Frequency: 912 MHz
+Total Optimal Antenna Length ("L"): 6.1 Inches
+Element Length (Half Dipole) ("E"): 3.1 Inches
+
+'''
+import subprocess
+import signal
+import sys
+import os
+import time
+import requests
+import paho.mqtt.publish as publish
+import settings
+
+# Constants
+HC_SECONDS_INTERVAL = 5 * 60
+HC_URL = 'https://hc-ping.com/887eec44-d131-4802-a4d9-0d69876cb9ce'
+
+def shutdown(signum, frame):
+    """Shutdown handler to terminate processes."""
+    for process in ['rtlamr', 'rtl_tcp', 'rtlamr2mqtt']:
+        subprocess.call(f'/usr/bin/pkill -9 {process}', shell=True)
+    sys.exit(0)
+
+def send_mqtt(topic, payload, auth):
+    """Send MQTT message."""
+    try:
+        publish.single(topic, payload=payload, qos=1,
+                       hostname=settings.MQTT_HOST, port=settings.MQTT_PORT, auth=auth)
+    except Exception as ex:
+        print(f"MQTT Publish Failed: {ex}")
+
+def start_process(command, shell=False):
+    """Start a subprocess."""
+    return subprocess.Popen(
+        command, shell=shell, stdin=None, stdout=subprocess.PIPE if not shell else None,
+        stderr=None, close_fds=True
+    )
+
+def process_water_meter(lineFields):
+    """Process water meter data and send MQTT messages."""
+    water_data = {
+        'NoUse': lineFields[5],
+        'BackFlow': lineFields[6],
+        'TotalValue': str(float(lineFields[7]) / 10),
+        'LeakDetected': lineFields[9], # This stays on for a few weeks after a leak
+        'LeakNowDetected': lineFields[10]
+    }
+    for key, value in water_data.items():
+        send_mqtt(f'Home/WaterMeter/{key}', value, auth)
+
+def process_gas_meter(lineFields):
+    """Process gas meter data and send MQTT messages."""
+    send_mqtt('Home/GasMeterTotalValue', lineFields[7], auth)
+
+def health_check():
+    """Perform health check."""
+    try:
+        response = requests.get(HC_URL)
+        if 'OK' in response.text:
+            print("Good UtilityMeterCheck Health Check")
+        else:
+            print("BAD UtilityMeterCheck Health Check")
+    except Exception as ex:
+        print(f"Health Check Failed: {ex}")
+
+# Main script
+if __name__ == "__main__":
+    try:
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+
+        auth = {'username': settings.MQTT_USER, 'password': settings.MQTT_PASSWORD} if settings.MQTT_USER and settings.MQTT_PASSWORD else None
+
+        time.sleep(5)
+        rtltcp = start_process([settings.RTL_TCP + " > /dev/null 2>&1 &"], shell=True)
+        time.sleep(5)
+        rtlamr = start_process([
+            os.path.expanduser(settings.RTLAMR),
+            '-msgtype=scm,r900',
+            '-filterid=' + ','.join(settings.WATCHED_METERS),
+            '-format=csv'
+        ])
+
+        hc_previous_seconds = -200000
+        print('Starting loop')
+
+        while True:
+            # rtlamr's readline returns byte list, remove whitespace and convert to string
+        
+            # Example Water JSON:
+            # {Time:2023-03-12T12:38:19.379 R900:{ID: 701279268 Unkn1:0x83 NoUse:36 BackFlow:0 Consumption: 156864 Unkn3:0x00 Leak: 0 LeakNow:0}}
+            # Example Gas JSON:
+            # {Time:2023-03-12T12:32:16.022 SCM:{ID:48558014 Type:12 Tamper:{Phy:03 Enc:00} Consumption:  572334 CRC:0x6629}}
+            amrline = rtlamr.stdout.readline().strip().decode()
+            # Example Water Read: '2023-03-12T12:29:39.41563046-04:00,0,0,701279268,131,36,0,156864,0,0,0'
+            # Example Gas Read: '2023-03-12T12:28:31.026929668-04:00,0,0,48558014,12,0x3,0x0,572332,0xcc8e'
+            lineFields = amrline.split(',')
+
+            if len(lineFields) == 11 and lineFields[3] in settings.WATCHED_METERS:
+                process_water_meter(lineFields)
+            elif len(lineFields) == 9 and lineFields[3] in settings.WATCHED_METERS:
+                process_gas_meter(lineFields)
+            else:
+                print(f'Received unknown ID: {lineFields[3]}')
+
+            hc_current_seconds = time.time()
+            if hc_current_seconds - hc_previous_seconds > HC_SECONDS_INTERVAL or hc_current_seconds < hc_previous_seconds:
+                health_check()
+                hc_previous_seconds = hc_current_seconds
+
+    except Exception as ex:
+        print(ex)
+        time.sleep(2)
+        sys.exit(1)
