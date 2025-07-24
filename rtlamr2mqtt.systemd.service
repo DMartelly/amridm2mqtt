@@ -1,0 +1,21 @@
+[Unit]
+Description=RTL AMR to MQTT
+After=network.target
+
+[Service]
+Type=simple
+User=domin
+Group=domin
+ExecStart=/opt/amridm2mqtt/rtlamr2mqtt
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=rtlamr2mqtt
+WorkingDirectory=/opt/amridm2mqtt
+
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+
+# Location: /etc/systemd/system/rtlamr2mqtt.service
