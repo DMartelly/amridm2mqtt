@@ -12,6 +12,7 @@ Total Optimal Antenna Length ("L"): 6.1 Inches
 Element Length (Half Dipole) ("E"): 3.1 Inches
 
 '''
+
 import subprocess
 import signal
 import sys
@@ -20,6 +21,21 @@ import time
 import requests
 import paho.mqtt.publish as publish
 import settings
+import logging
+import logging.handlers
+
+
+# Logging setup
+logger = logging.getLogger("rtlamr2mqtt")
+logger.setLevel(logging.INFO)
+syslog_handler = logging.handlers.SysLogHandler(address='/dev/log')
+formatter = logging.Formatter('%(name)s: %(levelname)s %(message)s')
+syslog_handler.setFormatter(formatter)
+logger.addHandler(syslog_handler)
+# Also log to console
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 # Constants
 HC_SECONDS_INTERVAL = 5 * 60
@@ -29,6 +45,7 @@ def shutdown(signum, frame):
     """Shutdown handler to terminate processes."""
     for process in ['rtlamr', 'rtl_tcp', 'rtlamr2mqtt']:
         subprocess.call(f'/usr/bin/pkill -9 {process}', shell=True)
+    logger.info("Shutdown signal received. Exiting.")
     sys.exit(0)
 
 def send_mqtt(topic, payload, auth):
@@ -37,7 +54,7 @@ def send_mqtt(topic, payload, auth):
         publish.single(topic, payload=payload, qos=1,
                        hostname=settings.MQTT_HOST, port=settings.MQTT_PORT, auth=auth)
     except Exception as ex:
-        print(f"MQTT Publish Failed: {ex}")
+        logger.error(f"MQTT Publish Failed: {ex}")
 
 def start_process(command, shell=False):
     """Start a subprocess."""
@@ -67,11 +84,11 @@ def health_check():
     try:
         response = requests.get(HC_URL)
         if 'OK' in response.text:
-            print("Good UtilityMeterCheck Health Check")
+            logger.info("Good UtilityMeterCheck Health Check")
         else:
-            print("BAD UtilityMeterCheck Health Check")
+            logger.warning("BAD UtilityMeterCheck Health Check")
     except Exception as ex:
-        print(f"Health Check Failed: {ex}")
+        logger.error(f"Health Check Failed: {ex}")
 
 # Main script
 if __name__ == "__main__":
@@ -92,7 +109,8 @@ if __name__ == "__main__":
         ])
 
         hc_previous_seconds = -200000
-        print('Starting loop')
+
+        logger.info('Starting loop')
 
         while True:
             # rtlamr's readline returns byte list, remove whitespace and convert to string
@@ -111,7 +129,7 @@ if __name__ == "__main__":
             elif len(lineFields) == 9 and lineFields[3] in settings.WATCHED_METERS:
                 process_gas_meter(lineFields)
             else:
-                print(f'Received unknown ID: {lineFields[3]}')
+                logger.warning(f'Received unknown ID: {lineFields[3]}')
 
             hc_current_seconds = time.time()
             if hc_current_seconds - hc_previous_seconds > HC_SECONDS_INTERVAL or hc_current_seconds < hc_previous_seconds:
@@ -119,6 +137,7 @@ if __name__ == "__main__":
                 hc_previous_seconds = hc_current_seconds
 
     except Exception as ex:
-        print(ex)
+        logger.error(f"Fatal error: {ex}")
         time.sleep(2)
         sys.exit(1)
+        
